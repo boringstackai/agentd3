@@ -10,6 +10,9 @@ Prebuilt binaries and a one-command installer for the **agentd3 stack**:
   system agentd3's brain features use (Rust, Postgres + pgvector). Bundled on
   macOS/arm64; on other platforms agentd3 runs standalone with brain features
   degraded.
+- **agentd-gauge** — a native macOS dock app (Gio) showing live subscription
+  burn for every provider, fed by agentd3's usage endpoint. Bundled on
+  macOS/arm64.
 
 This repository is refreshed **daily** from the private source repos: every
 release carries the binaries plus everything needed to bring up a completely
@@ -80,6 +83,7 @@ bin/agentd3-swap     optional blue/green swap driver
 bin/mnemnosd         Mnemos memory daemon        (darwin-arm64 tarball)
 bin/mnemnosctl       Mnemos CLI                  (darwin-arm64 tarball)
 bin/mnemnos-ui       Mnemos web UI               (darwin-arm64 tarball)
+bin/agentd-gauge     macOS dock usage gauge      (darwin-arm64 tarball)
 install.sh           this installer
 MANIFEST             source shas + pinned engine/runtime versions
 README.md            this file

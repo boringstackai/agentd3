@@ -11,7 +11,8 @@
 #
 # What it sets up (idempotent — safe to re-run to upgrade):
 #   <prefix>/bin/            agentd3, agentd3-ui, agentd3-front, agentd3-swap
-#                            (+ mnemnosd, mnemnosctl, mnemnos-ui when bundled)
+#                            (+ mnemnosd, mnemnosctl, mnemnos-ui, agentd-gauge
+#                             when bundled for the platform)
 #   <prefix>/go.mod          stub marker so the daemon resolves <prefix> as root
 #   <prefix>/local/config.toml   created once, never overwritten
 #   <prefix>/local/bun/      pinned bun runtime (drives the omp engine)
@@ -89,6 +90,8 @@ SOURCE_SHA="$(manifest_get SOURCE_SHA)"
 [ -n "$OMP_VERSION" ] && [ -n "$BUN_VERSION" ] || fail "MANIFEST incomplete"
 HAVE_MNEMNOS=0
 [ -x "$script_dir/bin/mnemnosd" ] && HAVE_MNEMNOS=1
+HAVE_GAUGE=0
+[ -x "$script_dir/bin/agentd-gauge" ] && HAVE_GAUGE=1
 
 OS="$(uname -s)"
 say "installing agentd3 (source $SOURCE_SHA, omp $OMP_VERSION, bun $BUN_VERSION) into $PREFIX"
@@ -169,6 +172,7 @@ fi
 # Stage-then-rename so a running daemon's binary is never truncated in place.
 stack_bins="agentd3 agentd3-ui agentd3-front agentd3-swap"
 [ "$HAVE_MNEMNOS" = 1 ] && stack_bins="$stack_bins mnemnosd mnemnosctl mnemnos-ui"
+[ "$HAVE_GAUGE" = 1 ] && stack_bins="$stack_bins agentd-gauge"
 for b in $stack_bins; do
   cp "$script_dir/bin/$b" "$PREFIX/bin/.$b.new"
   chmod +x "$PREFIX/bin/.$b.new"
@@ -254,7 +258,7 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] update check ($REPO)"
 remote="$(curl -fsSL --retry 3 "https://github.com/$REPO/releases/latest/download/VERSION")" || {
   echo "update check failed: cannot fetch VERSION" >&2; exit 1; }
 changed=0
-for k in SOURCE_SHA OMP_VERSION BUN_VERSION MNEMNOS_SHA; do
+for k in SOURCE_SHA OMP_VERSION BUN_VERSION MNEMNOS_SHA GAUGE_SHA; do
   want="$(printf '%s\n' "$remote" | grep -m1 "^$k=" | cut -d= -f2- || true)"
   got="$(grep -m1 "^$k=" "$PREFIX/MANIFEST" 2>/dev/null | cut -d= -f2- || true)"
   if [ "$want" != "$got" ]; then
@@ -282,6 +286,9 @@ if [ "$NO_SERVICE" = 1 ]; then
   if [ "$HAVE_MNEMNOS" = 1 ]; then
     echo "  cd $PREFIX && ./bin/mnemnosd --config local/mnemnos.toml"
     echo "  cd $PREFIX && ./bin/mnemnos-ui --config local/mnemnos-ui.toml"
+  fi
+  if [ "$HAVE_GAUGE" = 1 ]; then
+    echo "  cd $PREFIX && ./bin/agentd-gauge   # macOS dock usage gauge"
   fi
 else
   if [ "$OS" = Darwin ]; then
@@ -315,6 +322,10 @@ EOF
     fi
     write_plist com.boringstack.agentd3 "$PREFIX/bin/agentd3" serve
     write_plist com.boringstack.agentd3-ui "$PREFIX/bin/agentd3-ui"
+    # agentd-gauge is a Dock GUI app; it retries until agentd3's usage feed is up.
+    if [ "$HAVE_GAUGE" = 1 ]; then
+      write_plist com.boringstack.agentd-gauge "$PREFIX/bin/agentd-gauge"
+    fi
     # Daily 04:30 update check. Never (re)bootstrapped from inside an updater
     # run — launchctl bootout of this label would kill the running update.
     if [ "$FROM_UPDATER" = 0 ]; then
