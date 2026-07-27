@@ -169,8 +169,8 @@ if [ ! -f "$PREFIX/local/config.toml" ]; then
 
 [catalog]
 # Optional local Ollama endpoint. When set, model discovery, auto-titling, and
-# outcome polish use it; when absent, those features stay silently degraded
-# (they are never required for normal operation).
+# outcome summarization use it; when absent, those features stay silently
+# degraded (they are never required for normal operation).
 # ollama_host = "http://127.0.0.1:11434"
 EOF
 fi
