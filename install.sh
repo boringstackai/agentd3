@@ -95,9 +95,55 @@ HAVE_GAUGE=0
 
 OS="$(uname -s)"
 say "installing agentd3 (source $SOURCE_SHA, omp $OMP_VERSION, bun $BUN_VERSION) into $PREFIX"
+if [ -f "$PREFIX/local/config.toml" ]; then
+  fresh_store_install=0
+else
+  fresh_store_install=1
+fi
 
 # --- dependencies ------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+
+postgres_scalar() {
+  psql -h 127.0.0.1 -p 5432 -d postgres -tAXc "$1"
+}
+
+ensure_postgres_database() {
+  local database="$1" exists
+  exists="$(postgres_scalar "SELECT 1 FROM pg_database WHERE datname='$database'")" \
+    || fail "cannot inspect PostgreSQL database $database"
+  if [ "$exists" != 1 ]; then
+    say "creating PostgreSQL database $database"
+    createdb -h 127.0.0.1 -p 5432 "$database" \
+      || fail "failed to create PostgreSQL database $database"
+  fi
+  [ "$(postgres_scalar "SELECT 1 FROM pg_database WHERE datname='$database'")" = 1 ] \
+    || fail "PostgreSQL database $database is still absent after setup"
+}
+
+configured_postgres_scalar() {
+  psql "$configured_postgres_dsn" -tAXc "$1"
+}
+
+require_configured_postgres_database() {
+  local database="$1" exists
+  exists="$(configured_postgres_scalar "SELECT 1 FROM pg_database WHERE datname='$database'")" \
+    || fail "cannot inspect PostgreSQL database $database on the configured authoritative cluster"
+  [ "$exists" = 1 ] \
+    || fail "PostgreSQL database $database is absent on the configured authoritative cluster; refusing to create it during an update"
+}
+
+config_store_value() {
+  awk -v wanted="$1" '
+    /^\[.*\]$/ { section=$0; next }
+    section == "[store]" && $0 ~ "^[[:space:]]*" wanted "[[:space:]]*=" {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      gsub(/^["\047]|["\047]$/, "")
+      print
+      exit
+    }
+  ' "$PREFIX/local/config.toml"
+}
 
 if [ "$OS" = Darwin ]; then
   if ! have brew; then
@@ -105,7 +151,7 @@ if [ "$OS" = Darwin ]; then
   /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"
 then re-run this installer."
   fi
-  if ! pg_isready -h 127.0.0.1 -p 5432 -q 2>/dev/null; then
+  if [ "$fresh_store_install" = 1 ] && ! pg_isready -h 127.0.0.1 -p 5432 -q 2>/dev/null; then
     say "Postgres not running — installing postgresql@17 via Homebrew"
     brew list postgresql@17 >/dev/null 2>&1 || brew install postgresql@17
     brew services start postgresql@17
@@ -113,6 +159,17 @@ then re-run this installer."
     PATH="$(brew --prefix postgresql@17)/bin:$PATH"
     for i in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 5432 -q && break; sleep 1; done
     pg_isready -h 127.0.0.1 -p 5432 -q || fail "Postgres did not become ready"
+  fi
+  if [ "$fresh_store_install" = 0 ] && ! have psql; then
+    for postgres_formula in postgresql@18 postgresql@17; do
+      if brew list "$postgres_formula" >/dev/null 2>&1; then
+        PATH="$(brew --prefix "$postgres_formula")/bin:$PATH"
+        break
+      fi
+    done
+  fi
+  if [ "$fresh_store_install" = 0 ] && ! have psql; then
+    fail "psql is required to attest the existing authoritative PostgreSQL store; refusing to install or start another server"
   fi
   if ! have npm; then
     say "npm missing — installing node via Homebrew"
@@ -123,14 +180,19 @@ then re-run this installer."
     brew install pgvector
   fi
 elif [ "$OS" = Linux ]; then
-  if ! pg_isready -h 127.0.0.1 -p 5432 -q 2>/dev/null; then
+  if [ "$fresh_store_install" = 1 ] && ! pg_isready -h 127.0.0.1 -p 5432 -q 2>/dev/null; then
     say "Postgres not running — installing via apt (needs sudo)"
     sudo apt-get update -qq && sudo apt-get install -y -qq postgresql
     sudo systemctl enable --now postgresql
     for i in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 5432 -q && break; sleep 1; done
     pg_isready -h 127.0.0.1 -p 5432 -q || fail "Postgres did not become ready"
-    # The daemon connects as the current OS user; give it a superuser role so it
-    # can create its own database (macOS/Homebrew grants this by default).
+  fi
+  if [ "$fresh_store_install" = 0 ] && ! have psql; then
+    fail "psql is required to attest the existing authoritative PostgreSQL store; refusing to install or start another server"
+  fi
+  if [ "$fresh_store_install" = 1 ]; then
+    # The daemon connects as the current OS user. Role/database creation is
+    # confined to explicit first-install bootstrap.
     sudo -u postgres createuser -s "$USER" 2>/dev/null || true
   fi
   if ! have npm; then
@@ -156,12 +218,24 @@ mkdir -p "$PREFIX/bin" "$PREFIX/local/state" "$PREFIX/local/omp/versions" \
 [ -f "$PREFIX/go.mod" ] || printf 'module agentd3-runtime\n' > "$PREFIX/go.mod"
 
 if [ ! -f "$PREFIX/local/config.toml" ]; then
-  cat > "$PREFIX/local/config.toml" <<'EOF'
+  # Fresh-machine bootstrap is the only installer path allowed to create
+  # databases. There is no prior authoritative identity to preserve yet.
+  ensure_postgres_database agentd3
+  postgres_identity="$(postgres_scalar "SELECT (pg_control_system()).system_identifier::text || '|' || current_setting('data_directory')")" \
+    || fail "cannot read PostgreSQL authoritative-store identity"
+  postgres_system_identifier="${postgres_identity%%|*}"
+  postgres_data_directory="${postgres_identity#*|}"
+  [ -n "$postgres_system_identifier" ] && [ -n "$postgres_data_directory" ] \
+    || fail "PostgreSQL returned an incomplete authoritative-store identity"
+  cat > "$PREFIX/local/config.toml" <<EOF
 # agentd3 machine-local configuration. Never overwritten by the installer.
 
 [store]
-# Postgres DSN. Empty/absent = postgres://<os-user>@127.0.0.1:5432/agentd3
-# postgres_dsn = ""
+# This exact DSN and server identity are required. The daemon fails closed on
+# any missing value or mismatch and never creates or selects another database.
+postgres_dsn = "postgres://$USER@127.0.0.1:5432/agentd3?sslmode=disable"
+postgres_system_identifier = "$postgres_system_identifier"
+postgres_data_directory = "$postgres_data_directory"
 
 [provider_auth]
 # Google Cloud project ID used by the Gemini OAuth flow (optional).
@@ -173,6 +247,30 @@ if [ ! -f "$PREFIX/local/config.toml" ]; then
 # degraded (they are never required for normal operation).
 # ollama_host = "http://127.0.0.1:11434"
 EOF
+else
+  # Updates must attest the existing store before making any database change.
+  # A different server at the same address is an outage, never a fresh install.
+  configured_postgres_dsn="$(config_store_value postgres_dsn)"
+  expected_postgres_system_identifier="$(config_store_value postgres_system_identifier)"
+  expected_postgres_data_directory="$(config_store_value postgres_data_directory)"
+  [ -n "$configured_postgres_dsn" ] \
+    || fail "existing local/config.toml must explicitly set [store] postgres_dsn"
+  [ -n "$expected_postgres_system_identifier" ] \
+    || fail "existing local/config.toml must explicitly set [store] postgres_system_identifier"
+  [ -n "$expected_postgres_data_directory" ] \
+    || fail "existing local/config.toml must explicitly set [store] postgres_data_directory"
+  actual_postgres_identity="$(configured_postgres_scalar "SELECT current_database() || '|' || (pg_control_system()).system_identifier::text || '|' || current_setting('data_directory')")" \
+    || fail "cannot connect to the configured authoritative PostgreSQL store"
+  actual_postgres_database="${actual_postgres_identity%%|*}"
+  actual_postgres_remainder="${actual_postgres_identity#*|}"
+  actual_postgres_system_identifier="${actual_postgres_remainder%%|*}"
+  actual_postgres_data_directory="${actual_postgres_remainder#*|}"
+  [ "$actual_postgres_database" = agentd3 ] \
+    || fail "configured PostgreSQL database is $actual_postgres_database, expected agentd3"
+  [ "$actual_postgres_system_identifier" = "$expected_postgres_system_identifier" ] \
+    || fail "configured PostgreSQL system identifier does not match the authoritative store"
+  [ "$actual_postgres_data_directory" = "$expected_postgres_data_directory" ] \
+    || fail "configured PostgreSQL data directory does not match the authoritative store"
 fi
 
 # Stage-then-rename so a running daemon's binary is never truncated in place.
@@ -240,11 +338,12 @@ bind = "127.0.0.1:8433"
 mnemnos_url = "http://127.0.0.1:8432"
 EOF
   fi
-  # mnemnosd migrates its schema itself but does not create its database.
-  if have createdb || { have brew && PATH="$(brew --prefix postgresql@17 2>/dev/null)/bin:$PATH" && have createdb; }; then
-    createdb -h 127.0.0.1 -p 5432 mnemnos 2>/dev/null || true
+  # mnemnosd migrates its schema itself but never creates its database. Only a
+  # fresh bootstrap may create it; updates merely attest its continued presence.
+  if [ "$fresh_store_install" = 1 ]; then
+    ensure_postgres_database mnemnos
   else
-    echo "WARNING: createdb not found; create the 'mnemnos' database manually" >&2
+    require_configured_postgres_database mnemnos
   fi
 fi
 

@@ -38,8 +38,12 @@ That single command:
    compares the installed versions against the latest release and reinstalls
    in place when anything changed — binaries, engine pin, and Mnemos alike.
 
-The agentd3 daemon creates and migrates its own Postgres database (`agentd3`)
-on first boot; the installer creates the `mnemnos` database and Mnemos migrates
+The installer explicitly creates the `agentd3` and `mnemnos` databases before
+first boot. The agentd3 daemon migrates only the configured existing database:
+it requires the configured PostgreSQL system identifier and canonical data
+directory to match before migration, and fails closed without creating or
+selecting another store. On updates, the installer attests that same identity
+before changing binaries and refuses to create either database. Mnemos migrates
 its own schema.
 
 After install:
