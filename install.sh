@@ -294,6 +294,8 @@ launch_gauges_on_start = true
 # [relay] — device-pairing relay is OFF by default on this machine. Pairing
 # endpoints stay disabled unless YOU opt in by adding your own relay here:
 # [relay]
+# base_url = <the origin of a relay you run yourself>
+# No relay origin — not even an example one — is written by this installer.
 EOF
 else
   # Updates must attest the existing store before making any database change.
@@ -412,6 +414,7 @@ else
   if [ "$OS" = Darwin ]; then
     la="$HOME/Library/LaunchAgents"
     mkdir -p "$la"
+    service_path="$(service_path_value)"
     write_plist() { # label, program...
       local label="$1"; shift
       local args=""
@@ -423,6 +426,7 @@ else
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key><array>$args</array>
   <key>WorkingDirectory</key><string>$PREFIX</string>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$service_path</string></dict>
   <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$PREFIX/local/state/$label.log</string>
