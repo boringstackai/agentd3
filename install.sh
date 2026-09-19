@@ -294,7 +294,6 @@ launch_gauges_on_start = true
 # [relay] — device-pairing relay is OFF by default on this machine. Pairing
 # endpoints stay disabled unless YOU opt in by adding your own relay here:
 # [relay]
-# base_url = "https://your-relay.example"
 EOF
 else
   # Updates must attest the existing store before making any database change.
