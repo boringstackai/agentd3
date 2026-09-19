@@ -15,12 +15,14 @@
 #                             when bundled for the platform)
 #   <prefix>/go.mod          stub marker so the daemon resolves <prefix> as root
 #   <prefix>/local/config.toml   created once, never overwritten
-#   <prefix>/local/bun/      pinned bun runtime (drives the omp engine)
-#   <prefix>/local/omp/      pinned @oh-my-pi/pi-coding-agent + current symlink
+#   <prefix>/runtime/pi/     exact-lock Pi SDK runtime used by the Go daemon
+#   <prefix>/local/omp/      retained unchanged when upgrading an OMP install
 #   <prefix>/local/mnemnos.toml + mnemnos-ui.toml   Mnemos config (created once)
-#   <prefix>/bin/agentd3-update  auto-updater + daily 04:30 schedule
-#   Postgres (+pgvector)     installed/started if absent
-#   Services                 launchd agents (macOS) / systemd user units (Linux)
+#   <prefix>/bin/agentd3-update  ZERO-DOWNTIME GitHub updater (the only entrypoint)
+#   ~/.config/daz-secrets/provider.toml  private provider (bundled binary)
+#   <prefix>/local/omp/      OMP broker runtime (bootstrapped; kept on upgrade)
+#   Postgres (+pgvector)     installed/started if absent; fail closed otherwise
+#   Services                 front (127.0.0.1:8620) + blue/green + gauge
 #
 # Usage:
 #   curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install.sh | bash
@@ -83,18 +85,47 @@ fi
 
 # -------------------------------------------------------------- local install --
 [ -f "$script_dir/MANIFEST" ] || fail "MANIFEST missing next to install.sh"
+[ -f "$script_dir/lib.sh" ] || fail "lib.sh missing next to install.sh"
+# shellcheck disable=SC1091
+. "$script_dir/lib.sh"
+
+# Upgrades never stop-the-world. The single entrypoint stages the idle color
+# and flips the front after healthz attests the new build_sha.
+if [ "$FROM_UPDATER" = 1 ]; then
+  [ -x "$script_dir/bin/agentd3-update" ] || [ -x "$script_dir/agentd3-update" ] \
+    || fail "agentd3-update missing from release tree"
+  updater="$script_dir/bin/agentd3-update"
+  [ -x "$updater" ] || updater="$script_dir/agentd3-update"
+  exec bash "$updater" --prefix "$PREFIX" --repo "$REPO" --from-tarball "$script_dir"
+fi
+
+mkdir -p "$PREFIX/local/state"
+acquire_install_lock "$PREFIX"
+trap 'release_install_lock "$PREFIX"' EXIT
+
+if [ -f "$PREFIX/local/config.toml" ] && [ -x "$PREFIX/bin/agentd3-front" ]; then
+  updater="$script_dir/bin/agentd3-update"
+  [ -x "$updater" ] || updater="$script_dir/agentd3-update"
+  [ -x "$updater" ] || fail "agentd3-update missing from release tree"
+  release_install_lock "$PREFIX"
+  exec bash "$updater" --prefix "$PREFIX" --repo "$REPO" --from-tarball "$script_dir"
+fi
+
 manifest_get() { grep -m1 "^$1=" "$script_dir/MANIFEST" | cut -d= -f2-; }
-OMP_VERSION="$(manifest_get OMP_VERSION)"
-BUN_VERSION="$(manifest_get BUN_VERSION)"
+PI_VERSION="$(manifest_get PI_VERSION)"
 SOURCE_SHA="$(manifest_get SOURCE_SHA)"
-[ -n "$OMP_VERSION" ] && [ -n "$BUN_VERSION" ] || fail "MANIFEST incomplete"
+OMP_VERSION="$(manifest_get OMP_VERSION)"
+[ -n "$PI_VERSION" ] && [ -n "$SOURCE_SHA" ] || fail "MANIFEST incomplete"
+[ -n "$OMP_VERSION" ] || fail "MANIFEST missing OMP_VERSION"
 HAVE_MNEMNOS=0
 [ -x "$script_dir/bin/mnemnosd" ] && HAVE_MNEMNOS=1
 HAVE_GAUGE=0
 [ -x "$script_dir/bin/agentd-gauge" ] && HAVE_GAUGE=1
+[ -x "$script_dir/bin/daz-secrets-provider-private" ] \
+  || fail "release is missing daz-secrets-provider-private; refusing to install"
 
 OS="$(uname -s)"
-say "installing agentd3 (source $SOURCE_SHA, omp $OMP_VERSION, bun $BUN_VERSION) into $PREFIX"
+say "installing agentd3 (source $SOURCE_SHA, Pi $PI_VERSION) into $PREFIX"
 if [ -f "$PREFIX/local/config.toml" ]; then
   fresh_store_install=0
 else
@@ -103,6 +134,15 @@ fi
 
 # --- dependencies ------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# libpq tries GSSAPI before it tries the authentication the server actually
+# asks for. On macOS every login gets a local-KDC ticket cache, and once those
+# tickets expire EVERY psql/createdb call dies with "could not initiate GSSAPI
+# security context … Ticket expired" — against a local trust-auth server that
+# was never going to speak Kerberos. Live 2026-09-16: that killed a greenline
+# release at the database-preparation step. Disable the negotiation outright:
+# this installer only ever talks to 127.0.0.1.
+export PGGSSENCMODE=disable
 
 postgres_scalar() {
   psql -h 127.0.0.1 -p 5432 -d postgres -tAXc "$1"
@@ -209,10 +249,10 @@ elif [ "$OS" = Linux ]; then
 else
   fail "unsupported OS: $OS"
 fi
+postgres_fail_closed_if_unready 127.0.0.1 5432
 
 # --- layout + binaries ---------------------------------------------------------
-mkdir -p "$PREFIX/bin" "$PREFIX/local/state" "$PREFIX/local/omp/versions" \
-         "$PREFIX/local/omp/state" "$PREFIX/local/omp/workdir"
+mkdir -p "$PREFIX/bin" "$PREFIX/runtime" "$PREFIX/local/state" "$PREFIX/local/pi/runtime-backups"
 
 # The daemon walks up from its cwd looking for go.mod to find its root.
 [ -f "$PREFIX/go.mod" ] || printf 'module agentd3-runtime\n' > "$PREFIX/go.mod"
@@ -246,6 +286,15 @@ postgres_data_directory = "$postgres_data_directory"
 # outcome summarization use it; when absent, those features stay silently
 # degraded (they are never required for normal operation).
 # ollama_host = "http://127.0.0.1:11434"
+
+[ui]
+# Default: start agentd-gauge with the daemon (one gauge per machine).
+launch_gauges_on_start = true
+
+# [relay] — device-pairing relay is OFF by default on this machine. Pairing
+# endpoints stay disabled unless YOU opt in by adding your own relay here:
+# [relay]
+# base_url = "https://your-relay.example"
 EOF
 else
   # Updates must attest the existing store before making any database change.
@@ -278,48 +327,42 @@ stack_bins="agentd3 agentd3-ui agentd3-front agentd3-swap"
 [ "$HAVE_MNEMNOS" = 1 ] && stack_bins="$stack_bins mnemnosd mnemnosctl mnemnos-ui"
 [ "$HAVE_GAUGE" = 1 ] && stack_bins="$stack_bins agentd-gauge"
 for b in $stack_bins; do
-  cp "$script_dir/bin/$b" "$PREFIX/bin/.$b.new"
-  chmod +x "$PREFIX/bin/.$b.new"
-  mv -f "$PREFIX/bin/.$b.new" "$PREFIX/bin/$b"
+  stage_then_mv "$script_dir/bin/$b" "$PREFIX/bin/$b"
 done
-if [ "$OS" = Darwin ]; then
-  # macOS SIGKILLs binaries whose signature does not validate after copying.
-  for b in $stack_bins; do
-    codesign --force -s - "$PREFIX/bin/$b" 2>/dev/null || true
-  done
+stage_then_mv "$script_dir/bin/agentd3" "$PREFIX/bin/agentd3.blue"
+stage_then_mv "$script_dir/bin/agentd3" "$PREFIX/bin/agentd3.green"
+stage_then_mv "$script_dir/bin/agentd3-ui" "$PREFIX/bin/agentd3-ui.blue"
+stage_then_mv "$script_dir/bin/agentd3-ui" "$PREFIX/bin/agentd3-ui.green"
+if [ -x "$script_dir/bin/agentd3-update" ]; then
+  stage_then_mv "$script_dir/bin/agentd3-update" "$PREFIX/bin/agentd3-update"
+elif [ -x "$script_dir/agentd3-update" ]; then
+  stage_then_mv "$script_dir/agentd3-update" "$PREFIX/bin/agentd3-update"
+else
+  fail "agentd3-update missing from release tree"
 fi
+cp "$script_dir/lib.sh" "$PREFIX/lib.sh"
+chmod +x "$PREFIX/bin/agentd3-update"
+# --- exact Pi SDK runtime ------------------------------------------------------
+node -e 'if (Number(process.versions.node.split(".")[0]) < 22) process.exit(1)' \
+  || fail "Pi SDK requires Node.js 22 or newer"
+pi_stage="$(mktemp -d "$PREFIX/local/pi/runtime-stage.XXXXXXXX")"
+cp -R "$script_dir/runtime/pi/." "$pi_stage/"
+rm -rf "$pi_stage/node_modules" "$pi_stage/node_modules.next"
+npm --prefix "$pi_stage" ci --ignore-scripts --no-audit --no-fund --loglevel=error \
+  || fail "Pi SDK exact-lock installation failed"
+installed_pi="$(node -e 'process.stdout.write(require(process.argv[1]).version)' \
+  "$pi_stage/node_modules/@earendil-works/pi-coding-agent/package.json")"
+[ "$installed_pi" = "$PI_VERSION" ] \
+  || fail "installed Pi SDK $installed_pi does not match manifest $PI_VERSION"
+if [ -d "$PREFIX/runtime/pi" ]; then
+  backup="$(mktemp -d "$PREFIX/local/pi/runtime-backups/$(date -u +%Y%m%dT%H%M%SZ)-$SOURCE_SHA.XXXXXXXX")"
+  rmdir "$backup"
+  mv "$PREFIX/runtime/pi" "$backup"
+fi
+mv "$pi_stage" "$PREFIX/runtime/pi"
 
-# --- bun runtime (drives the omp engine) --------------------------------------
-if [ ! -x "$PREFIX/local/bun/bin/bun" ] || \
-   [ "$("$PREFIX/local/bun/bin/bun" --version 2>/dev/null)" != "$BUN_VERSION" ]; then
-  say "installing bun $BUN_VERSION into $PREFIX/local/bun"
-  curl -fsSL https://bun.sh/install | BUN_INSTALL="$PREFIX/local/bun" bash -s -- "bun-v$BUN_VERSION" >/dev/null
-  [ -x "$PREFIX/local/bun/bin/bun" ] || fail "bun install failed"
-fi
-
-# --- pinned oh-my-pi engine ----------------------------------------------------
-# NOTE: the real package is @oh-my-pi/pi-coding-agent — bare "oh-my-pi" on npm
-# is an unrelated project.
-version_dir="$PREFIX/local/omp/versions/$OMP_VERSION"
-if [ ! -x "$version_dir/omp" ]; then
-  say "installing @oh-my-pi/pi-coding-agent@$OMP_VERSION"
-  mkdir -p "$version_dir"
-  npm install --prefix "$version_dir" "@oh-my-pi/pi-coding-agent@$OMP_VERSION" >/dev/null
-  cat > "$version_dir/omp" <<'EOF'
-#!/usr/bin/env bash
-# omp launcher. Resolves its own physical directory (pwd -P) so it works when
-# invoked directly or via the local/omp/current symlink. Uses the locally-installed
-# bun runtime and the pinned @oh-my-pi/pi-coding-agent package. No env vars required.
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-BUN_BIN="$DIR/../../../bun/bin/bun"
-exec "$BUN_BIN" "$DIR/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js" "$@"
-EOF
-  chmod +x "$version_dir/omp"
-fi
-rm -f "$PREFIX/local/omp/current"
-ln -s "versions/$OMP_VERSION" "$PREFIX/local/omp/current"
-"$PREFIX/local/omp/current/omp" --version >/dev/null 2>&1 || \
-  fail "omp engine smoke test failed ($PREFIX/local/omp/current/omp --version)"
+install_daz_secrets_stack "$script_dir"
+bootstrap_omp "$PREFIX" "$script_dir" "$OMP_VERSION"
 
 # --- Mnemos memory system (when bundled for this platform) ---------------------
 if [ "$HAVE_MNEMNOS" = 1 ]; then
@@ -347,53 +390,24 @@ EOF
   fi
 fi
 
-# --- record installed versions + write the auto-updater --------------------------
+# --- record installed versions (updater binary already staged) -----------------
 cp "$script_dir/MANIFEST" "$PREFIX/MANIFEST"
-cat > "$PREFIX/bin/agentd3-update" <<EOF
-#!/usr/bin/env bash
-# agentd3 stack auto-updater — written by install.sh; rewritten on every update.
-# Compares the latest release's VERSION asset against the installed MANIFEST and
-# re-runs the (freshly downloaded) installer when anything changed.
-set -euo pipefail
-PREFIX="$PREFIX"
-REPO="$REPO"
-EOF
-cat >> "$PREFIX/bin/agentd3-update" <<'EOF'
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] update check ($REPO)"
-remote="$(curl -fsSL --retry 3 "https://github.com/$REPO/releases/latest/download/VERSION")" || {
-  echo "update check failed: cannot fetch VERSION" >&2; exit 1; }
-changed=0
-for k in SOURCE_SHA OMP_VERSION BUN_VERSION MNEMNOS_SHA GAUGE_SHA; do
-  want="$(printf '%s\n' "$remote" | grep -m1 "^$k=" | cut -d= -f2- || true)"
-  got="$(grep -m1 "^$k=" "$PREFIX/MANIFEST" 2>/dev/null | cut -d= -f2- || true)"
-  if [ "$want" != "$got" ]; then
-    echo "  $k: $got -> $want"
-    changed=1
-  fi
-done
-if [ "$changed" = 0 ]; then
-  echo "up to date."
-  exit 0
-fi
-echo "updating..."
-tmp="$(mktemp -d /tmp/agentd3-update.XXXXXX)"
-curl -fsSL --retry 3 -o "$tmp/install.sh" \
-  "https://github.com/$REPO/releases/latest/download/install.sh"
-exec bash "$tmp/install.sh" --prefix "$PREFIX" --repo "$REPO" --from-updater
-EOF
-chmod +x "$PREFIX/bin/agentd3-update"
+atomic_require_runtime "$PREFIX"
+write_active_json "$PREFIX/local/front/active.json" blue true
 
 # --- services -------------------------------------------------------------------
+LAUNCH_GAUGES="$(config_has_launch_gauges "$PREFIX/local/config.toml")"
 if [ "$NO_SERVICE" = 1 ]; then
   say "skipping service setup (--no-service). Run manually:"
-  echo "  cd $PREFIX && ./bin/agentd3 serve"
-  echo "  cd $PREFIX && ./bin/agentd3-ui"
+  echo "  cd $PREFIX && ./bin/agentd3-front --daemon-listen 127.0.0.1:8620 --ui-listen 127.0.0.1:8621"
+  echo "  cd $PREFIX && ./bin/agentd3.blue serve -addr 127.0.0.1:8630"
+  echo "  cd $PREFIX && ./bin/agentd3-ui.blue -addr 127.0.0.1:8640 -api http://127.0.0.1:8620"
   if [ "$HAVE_MNEMNOS" = 1 ]; then
     echo "  cd $PREFIX && ./bin/mnemnosd --config local/mnemnos.toml"
     echo "  cd $PREFIX && ./bin/mnemnos-ui --config local/mnemnos-ui.toml"
   fi
   if [ "$HAVE_GAUGE" = 1 ]; then
-    echo "  cd $PREFIX && ./bin/agentd-gauge   # macOS dock usage gauge"
+    echo "  cd $PREFIX && ./bin/agentd-gauge"
   fi
 else
   if [ "$OS" = Darwin ]; then
@@ -419,16 +433,19 @@ EOF
       launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
       launchctl bootstrap "gui/$(id -u)" "$la/$label.plist"
     }
-    say "installing launchd agents"
-    # Mnemos first: agentd3's brain features probe it at startup.
+    say "installing launchd agents (front 127.0.0.1:8620 + blue/green)"
     if [ "$HAVE_MNEMNOS" = 1 ]; then
       write_plist com.boringstack.mnemnos "$PREFIX/bin/mnemnosd" --config "$PREFIX/local/mnemnos.toml"
       write_plist com.boringstack.mnemnos-ui "$PREFIX/bin/mnemnos-ui" --config "$PREFIX/local/mnemnos-ui.toml"
     fi
-    write_plist com.boringstack.agentd3 "$PREFIX/bin/agentd3" serve
-    write_plist com.boringstack.agentd3-ui "$PREFIX/bin/agentd3-ui"
-    # agentd-gauge is a Dock GUI app; it retries until agentd3's usage feed is up.
-    if [ "$HAVE_GAUGE" = 1 ]; then
+    write_plist com.boringstack.agentd3-front "$PREFIX/bin/agentd3-front" \
+      --daemon-listen 127.0.0.1:8620 --ui-listen 127.0.0.1:8621 \
+      --state "$PREFIX/local/front/active.json"
+    write_plist com.boringstack.agentd3-blue "$PREFIX/bin/agentd3.blue" serve -addr 127.0.0.1:8630
+    write_plist com.boringstack.agentd3-green "$PREFIX/bin/agentd3.green" serve -addr 127.0.0.1:8631 -standby
+    write_plist com.boringstack.agentd3-ui-blue "$PREFIX/bin/agentd3-ui.blue" -addr 127.0.0.1:8640 -api http://127.0.0.1:8620
+    write_plist com.boringstack.agentd3-ui-green "$PREFIX/bin/agentd3-ui.green" -addr 127.0.0.1:8641 -api http://127.0.0.1:8620
+    if [ "$HAVE_GAUGE" = 1 ] && [ "$LAUNCH_GAUGES" != "false" ]; then
       write_plist com.boringstack.agentd-gauge "$PREFIX/bin/agentd-gauge"
     fi
     # Daily 04:30 update check. Never (re)bootstrapped from inside an updater
@@ -452,30 +469,80 @@ EOF
   else
     sd="$HOME/.config/systemd/user"
     mkdir -p "$sd"
-    cat > "$sd/agentd3.service" <<EOF
+    cat > "$sd/agentd3-front.service" <<EOF
 [Unit]
-Description=agentd3 daemon
+Description=agentd3 front proxy (127.0.0.1:8620)
 After=network.target
 [Service]
 WorkingDirectory=$PREFIX
-ExecStart=$PREFIX/bin/agentd3 serve
+ExecStart=$PREFIX/bin/agentd3-front --daemon-listen 127.0.0.1:8620 --ui-listen 127.0.0.1:8621 --state $PREFIX/local/front/active.json
 Restart=always
 RestartSec=2
 [Install]
 WantedBy=default.target
 EOF
-    cat > "$sd/agentd3-ui.service" <<EOF
+    cat > "$sd/agentd3-blue.service" <<EOF
 [Unit]
-Description=agentd3 UI
+Description=agentd3 daemon blue
 After=network.target
 [Service]
 WorkingDirectory=$PREFIX
-ExecStart=$PREFIX/bin/agentd3-ui
+ExecStart=$PREFIX/bin/agentd3.blue serve -addr 127.0.0.1:8630
 Restart=always
 RestartSec=2
 [Install]
 WantedBy=default.target
 EOF
+    cat > "$sd/agentd3-green.service" <<EOF
+[Unit]
+Description=agentd3 daemon green (standby)
+After=network.target
+[Service]
+WorkingDirectory=$PREFIX
+ExecStart=$PREFIX/bin/agentd3.green serve -addr 127.0.0.1:8631 -standby
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=default.target
+EOF
+    cat > "$sd/agentd3-ui-blue.service" <<EOF
+[Unit]
+Description=agentd3 UI blue
+After=network.target
+[Service]
+WorkingDirectory=$PREFIX
+ExecStart=$PREFIX/bin/agentd3-ui.blue -addr 127.0.0.1:8640 -api http://127.0.0.1:8620
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=default.target
+EOF
+    cat > "$sd/agentd3-ui-green.service" <<EOF
+[Unit]
+Description=agentd3 UI green
+After=network.target
+[Service]
+WorkingDirectory=$PREFIX
+ExecStart=$PREFIX/bin/agentd3-ui.green -addr 127.0.0.1:8641 -api http://127.0.0.1:8620
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=default.target
+EOF
+    if [ "$HAVE_GAUGE" = 1 ]; then
+      cat > "$sd/agentd-gauge.service" <<EOF
+[Unit]
+Description=agentd-gauge
+After=network.target
+[Service]
+WorkingDirectory=$PREFIX
+ExecStart=$PREFIX/bin/agentd-gauge
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=default.target
+EOF
+    fi
     if [ "$HAVE_MNEMNOS" = 1 ]; then
       cat > "$sd/mnemnos.service" <<EOF
 [Unit]
@@ -519,28 +586,24 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-    say "installing systemd user units"
+    say "installing systemd user units (front 127.0.0.1:8620 + blue/green)"
     systemctl --user daemon-reload
     if [ "$HAVE_MNEMNOS" = 1 ]; then
       systemctl --user enable --now mnemnos.service mnemnos-ui.service
     fi
-    systemctl --user enable --now agentd3.service agentd3-ui.service
+    systemctl --user enable --now agentd3-front.service agentd3-blue.service agentd3-green.service \
+      agentd3-ui-blue.service agentd3-ui-green.service
+    if [ "$HAVE_GAUGE" = 1 ] && [ "$LAUNCH_GAUGES" != "false" ]; then
+      systemctl --user enable --now agentd-gauge.service
+    fi
     systemctl --user enable --now agentd3-update.timer
     loginctl show-user "$USER" 2>/dev/null | grep -q 'Linger=yes' || \
       echo "NOTE: run 'sudo loginctl enable-linger $USER' so services survive logout."
   fi
 
-  say "waiting for daemon health on 127.0.0.1:8620"
-  healthy=0
-  for i in $(seq 1 30); do
-    if curl -sf --max-time 2 http://127.0.0.1:8620/healthz >/dev/null 2>&1; then healthy=1; break; fi
-    sleep 2
-  done
-  if [ "$healthy" = 1 ]; then
-    say "agentd3 is up: API http://127.0.0.1:8620  UI http://127.0.0.1:8621"
-  else
-    fail "daemon did not become healthy in 60s — check $PREFIX/local/state/*.log"
-  fi
+  say "waiting for daemon health on 127.0.0.1:8620 (build_sha $SOURCE_SHA)"
+  wait_healthz_sha "http://127.0.0.1:8620/healthz" "$SOURCE_SHA" 30
+  say "agentd3 is up: API http://127.0.0.1:8620  UI http://127.0.0.1:8621"
   if [ "$HAVE_MNEMNOS" = 1 ]; then
     say "waiting for Mnemos health on 127.0.0.1:8432"
     m_healthy=0
@@ -558,13 +621,13 @@ fi
 
 say "done. Next steps:"
 cat <<EOF
-  1. Provider auth (at least one provider is needed to run turns):
-       cd $PREFIX && ./bin/agentd3 omp auth login <provider>
-     (OAuth providers: claude, openai/codex, grok, ...; API-key providers can
-      instead store keys in the OS keychain, e.g.: keyring set glm api_key)
+  1. Log in: open the UI at http://127.0.0.1:8621 and use the provider
+     controls to authenticate your OMP/Pi account (the bundled local broker
+     at $PREFIX/local/omp runs the OAuth flow). At least one provider login
+     is needed before turns can run. Credentials persist through the
+     configured daz-secrets provider and are never stored in runtime files.
   2. Open the UI:   http://127.0.0.1:8621   (Mnemos UI: http://127.0.0.1:8433)
   3. Config lives in $PREFIX/local/config.toml (DSN, optional settings).
-  4. Updates are automatic (daily 04:30 via bin/agentd3-update); run
-     $PREFIX/bin/agentd3-update any time to update immediately. Config and
-     state are always preserved.
+  4. Zero-downtime updates: $PREFIX/bin/agentd3-update (daily 04:30). That is
+     the only updater. It stages the idle color and flips the loopback front.
 EOF
